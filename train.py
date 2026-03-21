@@ -159,6 +159,9 @@ def train(cfg: TrainConfig) -> None:
         print(f"Dropout: {cfg.dropout}")
 
     # ---- auto batch size ----
+    # The large/xl presets enable gradient checkpointing which drastically
+    # reduces activation memory, allowing much larger batches than you'd
+    # expect from the parameter count alone.
     batch_size = cfg.batch_size
     if batch_size is None:
         if device.type == "cuda":
@@ -167,11 +170,11 @@ def train(cfg: TrainConfig) -> None:
             vram_gb = 0
 
         if vram_gb >= 30:
-            batch_table = {"small": 16, "medium": 8, "large": 4, "xl": 2}
+            batch_table = {"small": 16, "medium": 12, "large": 10, "xl": 8}
         elif vram_gb >= 22:
-            batch_table = {"small": 12, "medium": 6, "large": 2, "xl": 1}
+            batch_table = {"small": 12, "medium": 10, "large": 8, "xl": 6}
         else:
-            batch_table = {"small": 6, "medium": 3, "large": 1, "xl": 1}
+            batch_table = {"small": 6, "medium": 3, "large": 2, "xl": 1}
 
         batch_size = batch_table[cfg.preset]
         if device.type not in ("cuda",):
@@ -247,9 +250,24 @@ def train(cfg: TrainConfig) -> None:
         train_ppl = math.exp(accum_loss) if accum_loss < 20 else float("inf")
         epochs = total_tokens_seen / train_token_count if train_token_count else 0
 
-        # ---- logging ----
+        # ---- eval (runs before logging so val metrics land on the same CSV row) ----
+        do_eval = step > 0 and step % cfg.eval_interval == 0
+        val_loss_step, val_ppl_step = None, None
+        if do_eval:
+            val_loss_step, val_ppl_step = estimate_loss(model, val_ds, batch_size, cfg.eval_steps, device, ctx)
+            tqdm.write(f"step {step:5d} | val_loss {val_loss_step:.4f} | val_ppl {val_ppl_step:.1f}")
+
+            sample = generate_sample(model, device, ctx)
+            tqdm.write(f"  sample: {sample[:200]}{'...' if len(sample) > 200 else ''}")
+
+            if val_loss_step < best_val_loss:
+                best_val_loss = val_loss_step
+                _save_checkpoint(model, optimizer, config, step, val_loss_step, cfg.out_dir)
+                tqdm.write(f"  -> saved best checkpoint (val_loss={val_loss_step:.4f})")
+
+        # ---- logging (single CSV row with train + val metrics together) ----
         log_interval = 10 if step < 100 else 50
-        if step % log_interval == 0:
+        if step % log_interval == 0 or do_eval:
             if device.type == "cuda":
                 torch.cuda.synchronize()
             now = time.time()
@@ -273,38 +291,28 @@ def train(cfg: TrainConfig) -> None:
                 f"| {tok_per_sec:,.0f} tok/s{mem_str}"
             )
 
-            metrics.log(
+            row = dict(
                 step=step, train_loss=round(accum_loss, 4),
                 train_ppl=round(train_ppl, 1), lr=lr,
                 epoch=round(epochs, 3) if train_token_count else "",
                 tok_per_sec=round(tok_per_sec), vram_gb=round(mem_gb, 2),
                 elapsed_sec=round(elapsed, 1),
             )
-
-        # ---- eval + sample generation ----
-        if step > 0 and step % cfg.eval_interval == 0:
-            val_loss, val_ppl = estimate_loss(model, val_ds, batch_size, cfg.eval_steps, device, ctx)
-            tqdm.write(f"step {step:5d} | val_loss {val_loss:.4f} | val_ppl {val_ppl:.1f}")
-
-            sample = generate_sample(model, device, ctx)
-            tqdm.write(f"  sample: {sample[:200]}{'...' if len(sample) > 200 else ''}")
-
-            metrics.log(
-                step=step, val_loss=round(val_loss, 4), val_ppl=round(val_ppl, 1),
-                elapsed_sec=round(time.time() - t0, 1),
-            )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                _save_checkpoint(model, optimizer, config, step, val_loss, cfg.out_dir)
-                tqdm.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
+            if val_loss_step is not None:
+                row["val_loss"] = round(val_loss_step, 4)
+                row["val_ppl"] = round(val_ppl_step, 1)
+            metrics.log(**row)
 
     # ---- final save + summary ----
     val_loss, val_ppl = estimate_loss(model, val_ds, batch_size, cfg.eval_steps, device, ctx)
     _save_checkpoint(model, optimizer, config, cfg.max_steps, val_loss, cfg.out_dir, name="final.pt")
 
-    metrics.log(step=cfg.max_steps, val_loss=round(val_loss, 4), val_ppl=round(val_ppl, 1),
-                elapsed_sec=round(time.time() - t0, 1))
+    metrics.log(
+        step=cfg.max_steps, train_loss=round(accum_loss, 4), train_ppl=round(train_ppl, 1),
+        val_loss=round(val_loss, 4), val_ppl=round(val_ppl, 1),
+        lr=lr, epoch=round(epochs, 3) if train_token_count else "",
+        elapsed_sec=round(time.time() - t0, 1),
+    )
     metrics.close()
 
     if streaming:

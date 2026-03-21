@@ -92,6 +92,7 @@ class TrainConfig:
     min_lr: float = 3e-5
     weight_decay: float = 0.1
     grad_clip: float = 1.0
+    dropout: float = 0.0
     eval_interval: int = 250
     eval_steps: int = 20
     compile: bool = False

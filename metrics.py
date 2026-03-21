@@ -1,4 +1,5 @@
-"""Simple CSV metrics logger for training runs.
+"""
+Simple CSV metrics logger for training runs.
 
 Writes a CSV file to the output directory so training curves can be
 plotted with any tool (matplotlib, pandas, Excel, etc.).

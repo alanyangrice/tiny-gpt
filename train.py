@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from config import GPTConfig, TrainConfig
 from data import TextDataset, StreamingMixDataset, DATASET_PRESETS
-from data.metrics import MetricsLogger
+from metrics import MetricsLogger
 from model import GPT
 
 ENC = tiktoken.get_encoding("gpt2")

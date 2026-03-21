@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
@@ -75,3 +77,22 @@ class GPTConfig:
             block_size=1024, num_attn_res_blocks=8,
             use_gradient_checkpointing=True,
         )
+
+
+@dataclass
+class TrainConfig:
+    data: str
+    preset: str = "small"
+    out_dir: str = "checkpoints"
+    batch_size: int | None = None
+    grad_accum_steps: int = 4
+    max_steps: int = 5000
+    warmup_steps: int = 200
+    max_lr: float = 3e-4
+    min_lr: float = 3e-5
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+    eval_interval: int = 250
+    eval_steps: int = 20
+    compile: bool = False
+    device: str | None = None

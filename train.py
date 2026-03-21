@@ -22,8 +22,9 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from config import GPTConfig
+from config import GPTConfig, TrainConfig
 from model import GPT
+
 
 # ---------------------------------------------------------------------------
 # Data
@@ -105,31 +106,15 @@ def estimate_loss(model: GPT, dataset: TextDataset, batch_size: int, eval_steps:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Training loop
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Train GPT with Block Attention Residuals")
-    parser.add_argument("--data", type=str, required=True, help="Path to training text file")
-    parser.add_argument("--preset", type=str, default="small", choices=["small", "medium", "large", "xl"])
-    parser.add_argument("--out_dir", type=str, default="checkpoints")
-    parser.add_argument("--batch_size", type=int, default=None, help="Micro batch size (auto if not set)")
-    parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=5000)
-    parser.add_argument("--warmup_steps", type=int, default=200)
-    parser.add_argument("--max_lr", type=float, default=3e-4)
-    parser.add_argument("--min_lr", type=float, default=3e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--eval_interval", type=int, default=250)
-    parser.add_argument("--eval_steps", type=int, default=20)
-    parser.add_argument("--compile", action="store_true", help="Use torch.compile")
-    parser.add_argument("--device", type=str, default=None)
-    args = parser.parse_args()
+def train(cfg: TrainConfig) -> None:
+    """Run the full training loop with the given configuration."""
 
     # ---- device ----
-    if args.device:
-        device = torch.device(args.device)
+    if cfg.device:
+        device = torch.device(cfg.device)
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -144,15 +129,16 @@ def main():
 
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
-    ctx = torch.amp.autocast(device_type=device.type, dtype=dtype) if device.type in ("cuda",) else torch.amp.autocast(device_type="cpu", enabled=False)
+    ctx = torch.amp.autocast(device_type=device.type, dtype=dtype) if device.type == "cuda" else torch.amp.autocast(device_type="cpu", enabled=False)
     print(f"Using dtype: {dtype}")
 
     # ---- config ----
     config_fn = {"small": GPTConfig.small, "medium": GPTConfig.medium, "large": GPTConfig.large, "xl": GPTConfig.xl}
-    config = config_fn[args.preset]()
+    config = config_fn[cfg.preset]()
 
     # ---- auto batch size ----
-    if args.batch_size is None:
+    batch_size = cfg.batch_size
+    if batch_size is None:
         if device.type == "cuda":
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         else:
@@ -161,56 +147,56 @@ def main():
             batch_table = {"small": 24, "medium": 12, "large": 4, "xl": 2}
         else:
             batch_table = {"small": 16, "medium": 8, "large": 4, "xl": 2}
-        args.batch_size = batch_table[args.preset]
+        batch_size = batch_table[cfg.preset]
         if device.type not in ("cuda",):
-            args.batch_size = min(args.batch_size, 4)
-    print(f"Batch size: {args.batch_size}, grad accum steps: {args.grad_accum_steps}")
-    print(f"Effective batch size: {args.batch_size * args.grad_accum_steps}")
+            batch_size = min(batch_size, 4)
+    print(f"Batch size: {batch_size}, grad accum steps: {cfg.grad_accum_steps}")
+    print(f"Effective batch size: {batch_size * cfg.grad_accum_steps}")
 
     # ---- data ----
-    train_ds = TextDataset(args.data, config.block_size, split="train").pin(device)
-    val_ds = TextDataset(args.data, config.block_size, split="val").pin(device)
+    train_ds = TextDataset(cfg.data, config.block_size, split="train").pin(device)
+    val_ds = TextDataset(cfg.data, config.block_size, split="val").pin(device)
     print(f"Train tokens: {len(train_ds.data):,}, Val tokens: {len(val_ds.data):,}")
 
     # ---- model ----
     model = GPT(config).to(device=device, dtype=dtype)
-    if args.compile and device.type == "cuda":
+    if cfg.compile and device.type == "cuda":
         print("Compiling model with torch.compile (reduce-overhead) ...")
         model = torch.compile(model, mode="reduce-overhead")
 
     # ---- optimizer ----
-    param_groups = _get_param_groups(model, args.weight_decay)
+    param_groups = _get_param_groups(model, cfg.weight_decay)
     use_fused = device.type == "cuda"
-    optimizer = torch.optim.AdamW(param_groups, lr=args.max_lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+    optimizer = torch.optim.AdamW(param_groups, lr=cfg.max_lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
 
     # ---- output dir ----
-    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(cfg.out_dir, exist_ok=True)
 
     # ---- training loop ----
     model.train()
     best_val_loss = float("inf")
-    tokens_per_step = args.batch_size * args.grad_accum_steps * config.block_size
+    tokens_per_step = batch_size * cfg.grad_accum_steps * config.block_size
     t0 = time.time()
     t_last_log = t0
 
-    for step in tqdm(range(args.max_steps), desc="Training"):
-        lr = get_lr(step, args.warmup_steps, args.max_steps, args.max_lr, args.min_lr)
+    for step in tqdm(range(cfg.max_steps), desc="Training"):
+        lr = get_lr(step, cfg.warmup_steps, cfg.max_steps, cfg.max_lr, cfg.min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
         # gradient accumulation
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
-        for micro_step in range(args.grad_accum_steps):
-            x, y = train_ds.get_batch(args.batch_size, device)
+        for micro_step in range(cfg.grad_accum_steps):
+            x, y = train_ds.get_batch(batch_size, device)
             with ctx:
                 _, loss = model(x, y)
-            loss = loss / args.grad_accum_steps
+            loss = loss / cfg.grad_accum_steps
             loss.backward()
             accum_loss += loss.item()
 
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
         # ---- logging ----
@@ -229,17 +215,17 @@ def main():
             )
 
         # ---- eval ----
-        if step > 0 and step % args.eval_interval == 0:
-            val_loss = estimate_loss(model, val_ds, args.batch_size, args.eval_steps, device, ctx)
+        if step > 0 and step % cfg.eval_interval == 0:
+            val_loss = estimate_loss(model, val_ds, batch_size, cfg.eval_steps, device, ctx)
             tqdm.write(f"step {step:5d} | val_loss {val_loss:.4f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                _save_checkpoint(model, optimizer, config, step, val_loss, args.out_dir)
+                _save_checkpoint(model, optimizer, config, step, val_loss, cfg.out_dir)
                 tqdm.write(f"  -> saved best checkpoint (val_loss={val_loss:.4f})")
 
     # final save
-    val_loss = estimate_loss(model, val_ds, args.batch_size, args.eval_steps, device, ctx)
-    _save_checkpoint(model, optimizer, config, args.max_steps, val_loss, args.out_dir, name="final.pt")
+    val_loss = estimate_loss(model, val_ds, batch_size, cfg.eval_steps, device, ctx)
+    _save_checkpoint(model, optimizer, config, cfg.max_steps, val_loss, cfg.out_dir, name="final.pt")
     print(f"Training complete. Best val loss: {best_val_loss:.4f}")
 
 
@@ -272,6 +258,49 @@ def _save_checkpoint(model, optimizer, config, step, val_loss, out_dir, name="be
         "step": step,
         "val_loss": val_loss,
     }, os.path.join(out_dir, name))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Train GPT with Block Attention Residuals")
+    parser.add_argument("--data", type=str, required=True, help="Path to training text file")
+    parser.add_argument("--preset", type=str, default="small", choices=["small", "medium", "large", "xl"])
+    parser.add_argument("--out_dir", type=str, default="checkpoints")
+    parser.add_argument("--batch_size", type=int, default=None, help="Micro batch size (auto if not set)")
+    parser.add_argument("--grad_accum_steps", type=int, default=4)
+    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--warmup_steps", type=int, default=200)
+    parser.add_argument("--max_lr", type=float, default=3e-4)
+    parser.add_argument("--min_lr", type=float, default=3e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--eval_interval", type=int, default=250)
+    parser.add_argument("--eval_steps", type=int, default=20)
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile")
+    parser.add_argument("--device", type=str, default=None)
+    args = parser.parse_args()
+
+    cfg = TrainConfig(
+        data=args.data,
+        preset=args.preset,
+        out_dir=args.out_dir,
+        batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
+        max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
+        max_lr=args.max_lr,
+        min_lr=args.min_lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        eval_interval=args.eval_interval,
+        eval_steps=args.eval_steps,
+        compile=args.compile,
+        device=args.device,
+    )
+    train(cfg)
 
 
 if __name__ == "__main__":

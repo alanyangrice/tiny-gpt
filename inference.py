@@ -21,15 +21,26 @@ from config import GPTConfig
 from model import GPT
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> tuple[GPT, tiktoken.Encoding]:
+def load_model(
+    checkpoint_path: str,
+    device: torch.device,
+    compile_model: bool = False,
+) -> tuple[GPT, tiktoken.Encoding]:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config: GPTConfig = checkpoint["config"]
     config.use_gradient_checkpointing = False
 
+    use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    model_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
     model = GPT(config)
     model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
+    model.to(device=device, dtype=model_dtype)
     model.eval()
+
+    if compile_model and device.type == "cuda":
+        print("Compiling model with torch.compile ...")
+        model = torch.compile(model, mode="reduce-overhead")
 
     enc = tiktoken.get_encoding("gpt2")
     step = checkpoint.get("step", "?")
@@ -50,15 +61,26 @@ def generate(
     stream: bool = True,
 ) -> str:
     tokens = enc.encode_ordinary(prompt)
-    idx = torch.tensor([tokens], dtype=torch.long, device=device)
+    prompt_len = len(tokens)
+    total_len = prompt_len + max_new_tokens
+
+    buf = torch.zeros(1, total_len, dtype=torch.long, device=device)
+    buf[0, :prompt_len] = torch.tensor(tokens, dtype=torch.long, device=device)
+    cur_len = prompt_len
+
+    use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    dtype = torch.bfloat16 if use_bf16 else torch.float32
+    ctx = torch.amp.autocast(device_type=device.type, dtype=dtype) if device.type == "cuda" else torch.amp.autocast(device_type="cpu", enabled=False)
 
     if stream:
         sys.stdout.write(prompt)
         sys.stdout.flush()
 
-    with torch.no_grad():
+    block_size = model.config.block_size
+    with torch.no_grad(), ctx:
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
+            start = max(0, cur_len - block_size)
+            idx_cond = buf[:, start:cur_len]
 
             logits, _ = model(idx_cond)
             logits = logits[:, -1, :] / temperature
@@ -76,15 +98,15 @@ def generate(
 
             probs = logits.softmax(dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, next_token], dim=1)
+            buf[0, cur_len] = next_token.squeeze()
+            cur_len += 1
 
             if stream:
                 tok_str = enc.decode([next_token.item()])
                 sys.stdout.write(tok_str)
                 sys.stdout.flush()
 
-    generated_tokens = idx[0].tolist()
-    text = enc.decode(generated_tokens)
+    text = enc.decode(buf[0, :cur_len].tolist())
 
     if stream:
         sys.stdout.write("\n")
@@ -102,6 +124,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--no_stream", action="store_true", help="Disable streaming output")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
@@ -114,7 +137,7 @@ def main():
     else:
         device = torch.device("cpu")
 
-    model, enc = load_model(args.checkpoint, device)
+    model, enc = load_model(args.checkpoint, device, compile_model=args.compile)
 
     print(f"--- Generating (temp={args.temperature}, top_k={args.top_k}, top_p={args.top_p}) ---")
     text = generate(

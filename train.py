@@ -58,15 +58,17 @@ class TextDataset:
             self.data = self.data.to(device)
         elif device.type == "cuda":
             self.data = self.data.pin_memory()
+        self._offsets = torch.arange(self.block_size, device=self.data.device)
         return self
 
     def __len__(self) -> int:
         return len(self.data) - self.block_size
 
     def get_batch(self, batch_size: int, device: torch.device) -> tuple[Tensor, Tensor]:
-        ix = torch.randint(0, len(self), (batch_size,))
-        x = torch.stack([self.data[i : i + self.block_size] for i in ix])
-        y = torch.stack([self.data[i + 1 : i + 1 + self.block_size] for i in ix])
+        ix = torch.randint(0, len(self), (batch_size,), device=self.data.device)
+        indices = ix.unsqueeze(1) + self._offsets.unsqueeze(0)
+        x = self.data[indices]
+        y = self.data[indices + 1]
         if self.data.device == device:
             return x, y
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -171,7 +173,7 @@ def main():
     print(f"Train tokens: {len(train_ds.data):,}, Val tokens: {len(val_ds.data):,}")
 
     # ---- model ----
-    model = GPT(config).to(device)
+    model = GPT(config).to(device=device, dtype=dtype)
     if args.compile and device.type == "cuda":
         print("Compiling model with torch.compile (reduce-overhead) ...")
         model = torch.compile(model, mode="reduce-overhead")
@@ -187,7 +189,9 @@ def main():
     # ---- training loop ----
     model.train()
     best_val_loss = float("inf")
+    tokens_per_step = args.batch_size * args.grad_accum_steps * config.block_size
     t0 = time.time()
+    t_last_log = t0
 
     for step in tqdm(range(args.max_steps), desc="Training"):
         lr = get_lr(step, args.warmup_steps, args.max_steps, args.max_lr, args.min_lr)
@@ -210,13 +214,18 @@ def main():
         optimizer.step()
 
         # ---- logging ----
-        if step % 50 == 0:
-            elapsed = time.time() - t0
-            tokens_per_step = args.batch_size * args.grad_accum_steps * config.block_size
-            tok_per_sec = tokens_per_step * (step + 1) / elapsed if elapsed > 0 else 0
+        log_interval = 10 if step < 100 else 50
+        if step % log_interval == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            now = time.time()
+            dt = now - t_last_log
+            steps_since = log_interval if step > 0 else 1
+            tok_per_sec = tokens_per_step * steps_since / dt if dt > 0 else 0
+            t_last_log = now
             tqdm.write(
                 f"step {step:5d} | loss {accum_loss:.4f} | lr {lr:.2e} "
-                f"| {elapsed:.1f}s | {tok_per_sec:,.0f} tok/s"
+                f"| {now - t0:.1f}s | {tok_per_sec:,.0f} tok/s"
             )
 
         # ---- eval ----

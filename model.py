@@ -10,7 +10,6 @@ Reference pseudocode: Figure 2 of the Attention Residuals paper.
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -21,18 +20,7 @@ from torch import Tensor
 from config import GPTConfig
 
 
-# ---------------------------------------------------------------------------
-# RMSNorm
-# ---------------------------------------------------------------------------
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: Tensor) -> Tensor:
-        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x * norm).to(x.dtype) * self.weight
+RMSNorm = nn.RMSNorm
 
 
 # ---------------------------------------------------------------------------
@@ -98,15 +86,12 @@ class GQACausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, rope_cos, rope_sin)
         k = apply_rotary_emb(k, rope_cos, rope_sin)
 
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
-
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=None,
             dropout_p=self.attn_dropout if self.training else 0.0,
             is_causal=True,
+            enable_gqa=self.n_rep > 1,
         )
 
         y = y.transpose(1, 2).contiguous().view(B, T, -1)

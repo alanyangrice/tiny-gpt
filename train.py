@@ -51,6 +51,15 @@ class TextDataset:
         )
         self.block_size = block_size
 
+    def pin(self, device: torch.device) -> "TextDataset":
+        """Move data to GPU if it fits comfortably (< 512 MB), otherwise pin to host memory."""
+        size_mb = self.data.nbytes / (1024 * 1024)
+        if device.type == "cuda" and size_mb < 512:
+            self.data = self.data.to(device)
+        elif device.type == "cuda":
+            self.data = self.data.pin_memory()
+        return self
+
     def __len__(self) -> int:
         return len(self.data) - self.block_size
 
@@ -58,7 +67,9 @@ class TextDataset:
         ix = torch.randint(0, len(self), (batch_size,))
         x = torch.stack([self.data[i : i + self.block_size] for i in ix])
         y = torch.stack([self.data[i + 1 : i + 1 + self.block_size] for i in ix])
-        return x.to(device), y.to(device)
+        if self.data.device == device:
+            return x, y
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +136,10 @@ def main():
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
+
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     ctx = torch.amp.autocast(device_type=device.type, dtype=dtype) if device.type in ("cuda",) else torch.amp.autocast(device_type="cpu", enabled=False)
@@ -136,23 +151,30 @@ def main():
 
     # ---- auto batch size ----
     if args.batch_size is None:
-        batch_table = {"small": 16, "medium": 8, "large": 4, "xl": 2}
+        if device.type == "cuda":
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        else:
+            vram_gb = 0
+        if device.type == "cuda" and vram_gb >= 24:
+            batch_table = {"small": 24, "medium": 12, "large": 4, "xl": 2}
+        else:
+            batch_table = {"small": 16, "medium": 8, "large": 4, "xl": 2}
         args.batch_size = batch_table[args.preset]
-        if device.type != "cuda":
+        if device.type not in ("cuda",):
             args.batch_size = min(args.batch_size, 4)
     print(f"Batch size: {args.batch_size}, grad accum steps: {args.grad_accum_steps}")
     print(f"Effective batch size: {args.batch_size * args.grad_accum_steps}")
 
     # ---- data ----
-    train_ds = TextDataset(args.data, config.block_size, split="train")
-    val_ds = TextDataset(args.data, config.block_size, split="val")
+    train_ds = TextDataset(args.data, config.block_size, split="train").pin(device)
+    val_ds = TextDataset(args.data, config.block_size, split="val").pin(device)
     print(f"Train tokens: {len(train_ds.data):,}, Val tokens: {len(val_ds.data):,}")
 
     # ---- model ----
     model = GPT(config).to(device)
     if args.compile and device.type == "cuda":
-        print("Compiling model with torch.compile ...")
-        model = torch.compile(model)
+        print("Compiling model with torch.compile (reduce-overhead) ...")
+        model = torch.compile(model, mode="reduce-overhead")
 
     # ---- optimizer ----
     param_groups = _get_param_groups(model, args.weight_decay)
@@ -190,7 +212,12 @@ def main():
         # ---- logging ----
         if step % 50 == 0:
             elapsed = time.time() - t0
-            tqdm.write(f"step {step:5d} | loss {accum_loss:.4f} | lr {lr:.2e} | {elapsed:.1f}s")
+            tokens_per_step = args.batch_size * args.grad_accum_steps * config.block_size
+            tok_per_sec = tokens_per_step * (step + 1) / elapsed if elapsed > 0 else 0
+            tqdm.write(
+                f"step {step:5d} | loss {accum_loss:.4f} | lr {lr:.2e} "
+                f"| {elapsed:.1f}s | {tok_per_sec:,.0f} tok/s"
+            )
 
         # ---- eval ----
         if step > 0 and step % args.eval_interval == 0:

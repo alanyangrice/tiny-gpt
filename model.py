@@ -130,13 +130,6 @@ class BlockAttnResOp(nn.Module):
         self.key_norm = RMSNorm(d_model)
 
     def forward(self, blocks: list[Tensor], partial_block: Tensor | None) -> Tensor:
-        """
-        Args:
-            blocks:  completed block reps including b0 (embedding).
-            partial_block:  intra-block partial sum, or None at block start.
-        Returns:
-            Aggregated hidden state for the current sub-layer.
-        """
         if partial_block is not None:
             sources = torch.stack(blocks + [partial_block], dim=0)
         else:

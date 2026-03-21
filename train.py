@@ -76,6 +76,37 @@ class TextDataset:
 
 
 # ---------------------------------------------------------------------------
+# CUDA stream prefetcher
+# ---------------------------------------------------------------------------
+
+class BatchPrefetcher:
+    """Prefetches the next batch on a separate CUDA stream so data transfer
+    overlaps with the current training step's compute."""
+
+    def __init__(self, dataset: TextDataset, batch_size: int, device: torch.device):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.device = device
+        self.stream = torch.cuda.Stream() if device.type == "cuda" else None
+        self._next_x: Tensor | None = None
+        self._next_y: Tensor | None = None
+
+    def prefetch(self) -> None:
+        if self.stream is not None:
+            with torch.cuda.stream(self.stream):
+                self._next_x, self._next_y = self.dataset.get_batch(self.batch_size, self.device)
+        else:
+            self._next_x, self._next_y = self.dataset.get_batch(self.batch_size, self.device)
+
+    def next(self) -> tuple[Tensor, Tensor]:
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        x, y = self._next_x, self._next_y
+        self.prefetch()
+        return x, y
+
+
+# ---------------------------------------------------------------------------
 # Learning rate schedule
 # ---------------------------------------------------------------------------
 
@@ -126,6 +157,9 @@ def train(cfg: TrainConfig) -> None:
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
+        props = torch.cuda.get_device_properties(0)
+        vram_gb = props.total_memory / (1024 ** 3)
+        print(f"GPU: {props.name} ({vram_gb:.1f} GB)")
 
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
@@ -136,17 +170,21 @@ def train(cfg: TrainConfig) -> None:
     config_fn = {"small": GPTConfig.small, "medium": GPTConfig.medium, "large": GPTConfig.large, "xl": GPTConfig.xl}
     config = config_fn[cfg.preset]()
 
-    # ---- auto batch size ----
+    # ---- auto batch size (tuned for 5090 32GB GDDR7) ----
     batch_size = cfg.batch_size
     if batch_size is None:
         if device.type == "cuda":
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         else:
             vram_gb = 0
-        if device.type == "cuda" and vram_gb >= 24:
+
+        if vram_gb >= 30:         # RTX 5090 / A100 class
+            batch_table = {"small": 32, "medium": 16, "large": 6, "xl": 2}
+        elif vram_gb >= 22:       # RTX 4090 / 3090 class
             batch_table = {"small": 24, "medium": 12, "large": 4, "xl": 2}
         else:
-            batch_table = {"small": 16, "medium": 8, "large": 4, "xl": 2}
+            batch_table = {"small": 12, "medium": 6, "large": 2, "xl": 1}
+
         batch_size = batch_table[cfg.preset]
         if device.type not in ("cuda",):
             batch_size = min(batch_size, 4)
@@ -160,6 +198,11 @@ def train(cfg: TrainConfig) -> None:
 
     # ---- model ----
     model = GPT(config).to(device=device, dtype=dtype)
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
     if cfg.compile and device.type == "cuda":
         print("Compiling model with torch.compile (reduce-overhead) ...")
         model = torch.compile(model, mode="reduce-overhead")
@@ -171,6 +214,10 @@ def train(cfg: TrainConfig) -> None:
 
     # ---- output dir ----
     os.makedirs(cfg.out_dir, exist_ok=True)
+
+    # ---- prefetcher ----
+    prefetcher = BatchPrefetcher(train_ds, batch_size, device)
+    prefetcher.prefetch()
 
     # ---- training loop ----
     model.train()
@@ -184,11 +231,10 @@ def train(cfg: TrainConfig) -> None:
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # gradient accumulation
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
         for micro_step in range(cfg.grad_accum_steps):
-            x, y = train_ds.get_batch(batch_size, device)
+            x, y = prefetcher.next()
             with ctx:
                 _, loss = model(x, y)
             loss = loss / cfg.grad_accum_steps
@@ -208,10 +254,16 @@ def train(cfg: TrainConfig) -> None:
             dt = now - t_last_log
             steps_since = log_interval if step > 0 else 1
             tok_per_sec = tokens_per_step * steps_since / dt if dt > 0 else 0
+
+            mem_str = ""
+            if device.type == "cuda":
+                mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                mem_str = f" | vram {mem_gb:.1f}GB"
+
             t_last_log = now
             tqdm.write(
                 f"step {step:5d} | loss {accum_loss:.4f} | lr {lr:.2e} "
-                f"| {now - t0:.1f}s | {tok_per_sec:,.0f} tok/s"
+                f"| {now - t0:.1f}s | {tok_per_sec:,.0f} tok/s{mem_str}"
             )
 
         # ---- eval ----
@@ -226,6 +278,10 @@ def train(cfg: TrainConfig) -> None:
     # final save
     val_loss = estimate_loss(model, val_ds, batch_size, cfg.eval_steps, device, ctx)
     _save_checkpoint(model, optimizer, config, cfg.max_steps, val_loss, cfg.out_dir, name="final.pt")
+
+    if device.type == "cuda":
+        peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        print(f"Peak GPU memory: {peak_gb:.2f} GB")
     print(f"Training complete. Best val loss: {best_val_loss:.4f}")
 
 

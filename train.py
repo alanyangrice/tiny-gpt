@@ -170,7 +170,7 @@ def train(cfg: TrainConfig) -> None:
             vram_gb = 0
 
         if vram_gb >= 30:
-            batch_table = {"small": 16, "medium": 12, "large": 10, "xl": 8}
+            batch_table = {"small": 16, "medium": 12, "large": 16, "xl": 8}
         elif vram_gb >= 22:
             batch_table = {"small": 12, "medium": 10, "large": 8, "xl": 6}
         else:

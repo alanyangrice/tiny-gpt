@@ -28,8 +28,8 @@ DATASET_PRESETS: dict[str, HFDatasetConfig] = {
         weight=0.5,
     ),
     "slimpajama": HFDatasetConfig(
-        name="SlimPajama-627B",
-        path="cerebras/SlimPajama-627B",
+        name="SlimPajama-6B",
+        path="DKYoon/SlimPajama-6B",
         weight=0.3,
     ),
 }

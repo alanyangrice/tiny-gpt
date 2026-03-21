@@ -170,7 +170,11 @@ def train(cfg: TrainConfig) -> None:
     config_fn = {"small": GPTConfig.small, "medium": GPTConfig.medium, "large": GPTConfig.large, "xl": GPTConfig.xl}
     config = config_fn[cfg.preset]()
 
-    # ---- auto batch size (tuned for 5090 32GB GDDR7) ----
+    # ---- auto batch size ----
+    # AttnRes blocks accumulate and stack all block representations through
+    # depth, so activation memory is much higher than a vanilla transformer
+    # of the same parameter count.  Batch sizes below are conservative to
+    # avoid OOM; increase manually if your GPU has headroom.
     batch_size = cfg.batch_size
     if batch_size is None:
         if device.type == "cuda":
@@ -179,11 +183,11 @@ def train(cfg: TrainConfig) -> None:
             vram_gb = 0
 
         if vram_gb >= 30:         # RTX 5090 / A100 class
-            batch_table = {"small": 32, "medium": 16, "large": 6, "xl": 2}
+            batch_table = {"small": 16, "medium": 8, "large": 4, "xl": 2}
         elif vram_gb >= 22:       # RTX 4090 / 3090 class
-            batch_table = {"small": 24, "medium": 12, "large": 4, "xl": 2}
-        else:
             batch_table = {"small": 12, "medium": 6, "large": 2, "xl": 1}
+        else:
+            batch_table = {"small": 6, "medium": 3, "large": 1, "xl": 1}
 
         batch_size = batch_table[cfg.preset]
         if device.type not in ("cuda",):

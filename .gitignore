@@ -1,4 +1,7 @@
 __pycache__/
 venv/
-checkpoints/
+.venv/
+# Model weights only (metrics.csv and other small files under checkpoints/ are trackable).
+checkpoints/**/*.pt
+
 .cursor/

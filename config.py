@@ -2,6 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Micro-batch sizes by model preset, keyed by minimum total VRAM (GiB) of the CUDA device.
+# Tiers are checked from top to bottom; the first tier with total_vram_gib >= min_gib wins.
+# Block AttnRes is memory-heavy; medium+ presets use gradient checkpointing in GPTConfig.
+AUTO_MICRO_BATCH_TIERS: tuple[tuple[float, dict[str, int]], ...] = (
+    (30.0, {"small": 64, "medium": 32, "large": 16, "xl": 8}),
+    (22.0, {"small": 16, "medium": 16, "large": 8, "xl": 4}),
+    (0.0, {"small": 4, "medium": 3, "large": 2, "xl": 1}),
+)
+
+# When training on CPU/MPS, cap auto micro-batch after VRAM lookup (vram_gib is 0 → lowest tier).
+AUTO_MICRO_BATCH_CPU_MAX = 4
+
+
+def auto_micro_batch_size(total_vram_gib: float, preset: str) -> int:
+    """Return default micro-batch size for ``preset`` given GPU total memory in GiB (0 if not CUDA)."""
+    for min_gib, table in AUTO_MICRO_BATCH_TIERS:
+        if total_vram_gib >= min_gib:
+            return table[preset]
+    raise RuntimeError("AUTO_MICRO_BATCH_TIERS must be non-empty")
+
 
 def _round_multiple(x: int, multiple: int) -> int:
     return multiple * ((x + multiple - 1) // multiple)
@@ -54,10 +74,17 @@ class GPTConfig:
 
     @staticmethod
     def medium() -> "GPTConfig":
-        """~350M params. Sweet spot for RTX 5090."""
+        """~350M params. Tuned for ~32 GB GPUs (e.g. RTX 5090).
+
+        Block AttnRes keeps every committed block alive for the forward pass, so
+        activation memory is much higher than a vanilla transformer of the same
+        width/depth. Gradient checkpointing is enabled to avoid VRAM overspill
+        into unified/host memory on Windows.
+        """
         return GPTConfig(
             d_model=1024, n_layer=24, n_head=16, n_kv_head=4,
             block_size=1024, num_attn_res_blocks=8,
+            use_gradient_checkpointing=True,
         )
 
     @staticmethod

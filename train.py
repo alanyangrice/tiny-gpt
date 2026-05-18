@@ -25,7 +25,12 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from config import GPTConfig, TrainConfig
+from config import (
+    AUTO_MICRO_BATCH_CPU_MAX,
+    GPTConfig,
+    TrainConfig,
+    auto_micro_batch_size,
+)
 from data import TextDataset, StreamingMixDataset, DATASET_PRESETS
 from metrics import MetricsLogger
 from model import GPT
@@ -158,27 +163,16 @@ def train(cfg: TrainConfig) -> None:
         config.dropout = cfg.dropout
         print(f"Dropout: {cfg.dropout}")
 
-    # ---- auto batch size ----
-    # The large/xl presets enable gradient checkpointing which drastically
-    # reduces activation memory, allowing much larger batches than you'd
-    # expect from the parameter count alone.
+    # ---- auto batch size (tiers in config.AUTO_MICRO_BATCH_TIERS) ----
     batch_size = cfg.batch_size
     if batch_size is None:
         if device.type == "cuda":
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         else:
-            vram_gb = 0
-
-        if vram_gb >= 30:
-            batch_table = {"small": 16, "medium": 12, "large": 16, "xl": 8}
-        elif vram_gb >= 22:
-            batch_table = {"small": 12, "medium": 10, "large": 8, "xl": 6}
-        else:
-            batch_table = {"small": 6, "medium": 3, "large": 2, "xl": 1}
-
-        batch_size = batch_table[cfg.preset]
+            vram_gb = 0.0
+        batch_size = auto_micro_batch_size(vram_gb, cfg.preset)
         if device.type not in ("cuda",):
-            batch_size = min(batch_size, 4)
+            batch_size = min(batch_size, AUTO_MICRO_BATCH_CPU_MAX)
     print(f"Batch size: {batch_size}, grad accum steps: {cfg.grad_accum_steps}")
     print(f"Effective batch size: {batch_size * cfg.grad_accum_steps}")
 
@@ -201,6 +195,15 @@ def train(cfg: TrainConfig) -> None:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+    if cfg.compile and device.type == "cuda":
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            print(
+                "torch.compile skipped: Triton is not installed (Inductor on CUDA requires it). "
+                "Continuing without compile."
+            )
+            cfg.compile = False
     if cfg.compile and device.type == "cuda":
         print("Compiling model with torch.compile (reduce-overhead) ...")
         model = torch.compile(model, mode="reduce-overhead")
@@ -227,7 +230,13 @@ def train(cfg: TrainConfig) -> None:
     t0 = time.time()
     t_last_log = t0
 
-    for step in tqdm(range(cfg.max_steps), desc="Training"):
+    pbar = tqdm(
+        range(cfg.max_steps),
+        desc="Training",
+        unit="step",
+        dynamic_ncols=True,
+    )
+    for step in pbar:
         lr = get_lr(step, cfg.warmup_steps, cfg.max_steps, cfg.max_lr, cfg.min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -245,6 +254,7 @@ def train(cfg: TrainConfig) -> None:
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
+        pbar.set_postfix_str(f"{step + 1:,}/{cfg.max_steps:,}")
 
         total_tokens_seen += tokens_per_step
         train_ppl = math.exp(accum_loss) if accum_loss < 20 else float("inf")

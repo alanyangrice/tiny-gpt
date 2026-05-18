@@ -1,0 +1,2 @@
+step,train_loss,train_ppl,val_loss,val_ppl,lr,epoch,tok_per_sec,vram_gb,elapsed_sec
+0,10.9755,58423.3,,,1.4999999999999998e-06,0.408,13236,22.4,9.9

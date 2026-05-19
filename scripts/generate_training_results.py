@@ -44,8 +44,9 @@ def main() -> None:
     best_val = min(val_rows, key=lambda row: row["val_loss"])
 
     plt.style.use("default")
-    fig, ax = plt.subplots(figsize=(12, 6.75), dpi=160)
+    fig, ax = plt.subplots(figsize=(10, 4.4), dpi=160)
     fig.patch.set_facecolor("white")
+    fig.subplots_adjust(left=0.08, right=0.985, top=0.98, bottom=0.14)
 
     ax.set_facecolor("white")
     ax.grid(True, color="#d1d5db", alpha=0.7, linewidth=0.8)
@@ -57,12 +58,11 @@ def main() -> None:
     plot_series(ax, rows, "val_loss", "validation loss", "#dc2626", marker="o")
     ax.scatter(best_val["step"], best_val["val_loss"], color="#f59e0b", s=90, zorder=5, label="best result")
 
-    ax.set_title("TinyGPT Pretraining Results", color="#111827", loc="left", fontsize=24, fontweight="bold", pad=28)
     ax.set_xlabel("training step", color="#374151", fontsize=11)
     ax.set_ylabel("cross entropy loss", color="#374151", fontsize=11)
     ax.legend(facecolor="white", edgecolor="#d1d5db", labelcolor="#111827", fontsize=10)
 
-    fig.savefig(OUTPUT_PATH, bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(OUTPUT_PATH, facecolor=fig.get_facecolor())
     print(OUTPUT_PATH)
 
 

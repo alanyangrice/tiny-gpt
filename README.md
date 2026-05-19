@@ -4,6 +4,8 @@ A GPT language model built from scratch in PyTorch, using [Moonshot AI's Attenti
 
 The model uses a modern LLaMA-style architecture (RoPE, RMSNorm, SwiGLU, Grouped-Query Attention, Flash Attention) and supports streaming pre-training from HuggingFace datasets with zero disk usage.
 
+![TinyGPT pretraining results](assets/training_results.png)
+
 ## Architecture
 
 Standard transformers accumulate layer outputs with a fixed residual: `h = h + layer(h)`. Every layer gets the same uniform sum of everything before it. Attention Residuals replace this with a **learned, input-dependent** weighted sum over depth -- each layer decides how much to draw from each previous block via softmax attention with a per-layer pseudo-query vector.

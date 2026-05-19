@@ -3,5 +3,6 @@ venv/
 .venv/
 # Model weights only (metrics.csv and other small files under checkpoints/ are trackable).
 checkpoints/**/*.pt
+sft_checkpoints/**/*.pt
 
 .cursor/

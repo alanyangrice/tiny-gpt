@@ -21,6 +21,14 @@ from config import GPTConfig
 from model import GPT
 
 
+def format_chat_prompt(prompt: str, system: str | None = None) -> str:
+    """Return the User/Assistant prompt format used by supervised fine-tuning."""
+    prompt = prompt.strip()
+    if system:
+        return f"System: {system.strip()}\nUser: {prompt}\nAssistant:"
+    return f"User: {prompt}\nAssistant:"
+
+
 def load_model(
     checkpoint_path: str,
     device: torch.device,
@@ -59,6 +67,9 @@ def generate(
     top_p: float | None = None,
     device: torch.device = torch.device("cpu"),
     stream: bool = True,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
+    stop_on_eot: bool = True,
 ) -> str:
     tokens = enc.encode_ordinary(prompt)
     prompt_len = len(tokens)
@@ -84,6 +95,21 @@ def generate(
 
             logits, _ = model(idx_cond)
             logits = logits[:, -1, :] / temperature
+            generated = buf[0, :cur_len]
+
+            if repetition_penalty != 1.0:
+                seen_tokens = torch.unique(generated)
+                token_logits = logits[0, seen_tokens]
+                logits[0, seen_tokens] = torch.where(
+                    token_logits < 0,
+                    token_logits * repetition_penalty,
+                    token_logits / repetition_penalty,
+                )
+
+            if no_repeat_ngram_size > 0 and cur_len >= no_repeat_ngram_size - 1:
+                banned = _get_banned_ngram_tokens(generated.tolist(), no_repeat_ngram_size)
+                if banned:
+                    logits[0, banned] = float("-inf")
 
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -98,6 +124,8 @@ def generate(
 
             probs = logits.softmax(dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            if stop_on_eot and next_token.item() == enc.eot_token:
+                break
             buf[0, cur_len] = next_token.squeeze()
             cur_len += 1
 
@@ -115,6 +143,21 @@ def generate(
     return text
 
 
+def _get_banned_ngram_tokens(tokens: list[int], ngram_size: int) -> list[int]:
+    """Return tokens that would repeat an existing n-gram if sampled next."""
+    if ngram_size <= 0 or len(tokens) < ngram_size - 1:
+        return []
+
+    prefix_len = ngram_size - 1
+    current_prefix = tuple(tokens[-prefix_len:]) if prefix_len > 0 else tuple()
+    banned = []
+    for i in range(len(tokens) - ngram_size + 1):
+        ngram = tokens[i : i + ngram_size]
+        if tuple(ngram[:-1]) == current_prefix:
+            banned.append(ngram[-1])
+    return banned
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate text from trained GPT + AttnRes model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
@@ -123,9 +166,14 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--repetition_penalty", type=float, default=1.15)
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=3)
+    parser.add_argument("--no_stop_on_eot", action="store_true", help="Do not stop when GPT-2 EOT is sampled")
     parser.add_argument("--no_stream", action="store_true", help="Disable streaming output")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--chat", action="store_true", help="Wrap prompt as 'User: ...\\nAssistant:'")
+    parser.add_argument("--system", type=str, default=None, help="Optional system message for --chat")
     args = parser.parse_args()
 
     if args.device:
@@ -138,16 +186,20 @@ def main():
         device = torch.device("cpu")
 
     model, enc = load_model(args.checkpoint, device, compile_model=args.compile)
+    prompt = format_chat_prompt(args.prompt, args.system) if args.chat else args.prompt
 
     print(f"--- Generating (temp={args.temperature}, top_k={args.top_k}, top_p={args.top_p}) ---")
     text = generate(
-        model, enc, args.prompt,
+        model, enc, prompt,
         max_new_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
         device=device,
         stream=not args.no_stream,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        stop_on_eot=not args.no_stop_on_eot,
     )
 
     if args.no_stream:

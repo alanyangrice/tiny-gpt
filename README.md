@@ -62,6 +62,40 @@ python train.py --data hf --preset small --max_steps 50000
 
 The three datasets are mixed with default weights: 50% FineWeb-Edu (educational web text), 30% SlimPajama (web + books + code), 20% OpenWebText (Reddit-curated web).
 
+### Instruction tuning (SFT)
+
+After pretraining, fine-tune a checkpoint on a HuggingFace instruction dataset:
+
+```bash
+python sft.py --checkpoint checkpoints/best.pt --dataset tatsu-lab/alpaca \
+    --out_dir sft_checkpoints --max_steps 3000 --batch_size 4 --max_lr 2e-5
+```
+
+Better built-in SFT dataset presets are available:
+
+```bash
+# Cleaner small instruction dataset
+python sft.py --checkpoint checkpoints/best.pt --preset dolly \
+    --out_dir sft_checkpoints_dolly --max_steps 1500 --batch_size 4 --max_lr 2e-5
+
+# Larger chat-style dataset
+python sft.py --checkpoint checkpoints/best.pt --preset ultrachat \
+    --out_dir sft_checkpoints_ultrachat --max_examples 50000 --max_steps 5000 --batch_size 4 --max_lr 2e-5
+
+# Reconstructed user/assistant pairs from OpenAssistant
+python sft.py --checkpoint checkpoints/best.pt --preset openassistant \
+    --out_dir sft_checkpoints_oasst --max_steps 3000 --batch_size 4 --max_lr 2e-5
+```
+
+The SFT script formats examples as:
+
+```text
+User: <instruction plus optional input>
+Assistant: <response>
+```
+
+and masks prompt tokens so loss is applied only to the assistant response. Use `--preset {alpaca,dolly,ultrachat,openassistant}` for common datasets, or `--preset custom` with `--instruction_field`, `--input_field`, and `--response_field` for other Alpaca-style datasets.
+
 ### Key training options
 
 ```
@@ -112,6 +146,13 @@ python inference.py --checkpoint checkpoints/best.pt --prompt "Once upon a time"
 ```
 
 Text streams to the terminal token by token. Add `--compile` for faster generation on GPU.
+
+For an instruction-tuned checkpoint, use the same chat prompt template used during SFT:
+
+```bash
+python inference.py --checkpoint sft_checkpoints/best.pt --chat \
+    --prompt "Explain what a neural network is." --max_tokens 256
+```
 
 ## Model Presets
 

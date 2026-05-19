@@ -64,7 +64,6 @@ class StreamingMixDataset:
                 name=cfg.config_name,
                 split=cfg.split,
                 streaming=True,
-                trust_remote_code=True,
             )
             streams.append(ds)
             probs.append(cfg.weight)

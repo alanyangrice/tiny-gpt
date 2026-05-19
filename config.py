@@ -6,9 +6,9 @@ from dataclasses import dataclass
 # Tiers are checked from top to bottom; the first tier with total_vram_gib >= min_gib wins.
 # Block AttnRes is memory-heavy; medium+ presets use gradient checkpointing in GPTConfig.
 AUTO_MICRO_BATCH_TIERS: tuple[tuple[float, dict[str, int]], ...] = (
-    (30.0, {"small": 64, "medium": 32, "large": 16, "xl": 8}),
-    (22.0, {"small": 16, "medium": 16, "large": 8, "xl": 4}),
-    (0.0, {"small": 4, "medium": 3, "large": 2, "xl": 1}),
+    (30.0, {"small": 8, "medium": 12, "large": 4, "xl": 2}),
+    (22.0, {"small": 8, "medium": 8, "large": 3, "xl": 1}),
+    (0.0, {"small": 4, "medium": 3, "large": 1, "xl": 1}),
 )
 
 # When training on CPU/MPS, cap auto micro-batch after VRAM lookup (vram_gib is 0 → lowest tier).
